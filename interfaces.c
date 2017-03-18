@@ -144,12 +144,12 @@ int net_get_interfaces(struct net_interface **interfaces) {
 		if (ifaddrsp->ifa_addr == NULL)
 			continue;
 
-		if (ifaddrsp->ifa_addr->sa_family == AF_INET) {
+		if (ifaddrsp->ifa_addr->sa_family == AF_PACKET) {
 			struct net_interface *interface =
 			  net_get_interface_ptr(interfaces, ifaddrsp->ifa_name, 1);
 			if (interface != NULL) {
 				found++;
-				memcpy(interface->ipv4_addr, &dl_addr->sin_addr, IPV4_ALEN);
+				inet_pton(AF_INET, "0.0.0.0", &interface->ipv4_addr);
 			}
 #ifdef __linux__
 			interface->ifindex = get_device_index(interface->name);
@@ -172,6 +172,21 @@ int net_get_interfaces(struct net_interface **interfaces) {
 		}
 #endif
 	}
+
+	/* get IP adresses from AF_INET interfaces */
+	for (ifaddrsp = int_addrs; ifaddrsp; ifaddrsp = ifaddrsp->ifa_next) {
+		dl_addr = (const struct sockaddr_in *) ifaddrsp->ifa_addr;
+
+		if (ifaddrsp->ifa_addr == NULL)
+			continue;
+		if (ifaddrsp->ifa_addr->sa_family == AF_INET) {
+			struct net_interface *interface = net_get_interface_ptr(interfaces, ifaddrsp->ifa_name, 0);
+			if (interface != NULL) {
+				memcpy(interface->ipv4_addr, &dl_addr->sin_addr, IPV4_ALEN);
+			}
+		}
+	}
+
 	freeifaddrs(int_addrs);
 
 #ifdef __linux__

@@ -565,6 +565,9 @@ int main (int argc, char **argv) {
 	if (!is_a_tty) {
 		quiet_mode = 1;
 	}
+	else {
+		setbuf(stdout, NULL);
+	}
 
 	if (!no_autologin) {
 		autologin_readfile(autologin_path);

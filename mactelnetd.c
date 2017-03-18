@@ -106,6 +106,9 @@ static time_t last_mndp_time = 0;
 /* Protocol data direction */
 unsigned char mt_direction_fromserver = 1;
 
+/* Interrupt flags*/
+static int sighup_active=0;
+
 /* Anti-timeout is every 10 seconds. Give up after 15. */
 #define MT_CONNECTION_TIMEOUT 15
 
@@ -167,9 +170,6 @@ static void list_remove_connection(struct mt_connection *conn) {
 	if (conn->state == STATE_ACTIVE && conn->ptsfd > 0) {
 		close(conn->ptsfd);
 	}
-	if (conn->state == STATE_ACTIVE && conn->slavefd > 0) {
-		close(conn->slavefd);
-	}
 
 	uwtmp_logout(conn);
 
@@ -200,6 +200,19 @@ static struct net_interface *find_socket(unsigned char *mac) {
 	return NULL;
 }
 
+#ifdef __linux__
+static struct net_interface *find_socket_ifindex(unsigned int ifindex) {
+	struct net_interface *interface;
+
+	DL_FOREACH(interfaces, interface) {
+		if (interface->ifindex == ifindex) {
+			return interface;
+		}
+	}
+	return NULL;
+}
+#endif
+
 static void setup_sockets() {
 	struct net_interface *interface;
 
@@ -228,8 +241,16 @@ static void setup_sockets() {
 			/* Initialize receiving socket on the device chosen */
 			si_me.sin_family = AF_INET;
 			si_me.sin_port = htons(MT_MACTELNET_PORT);
-			memcpy(&(si_me.sin_addr.s_addr), interface->ipv4_addr, IPV4_ALEN);
+#if defined(__linux__)
 
+			if (setsockopt(interface->socketfd, SOL_SOCKET, SO_BINDTODEVICE, interface->name, sizeof(interface->name)) < 0) {
+				fprintf(stderr, _("Error setting socket to bind to interface name: %s, %s\n"), interface->name, strerror(errno));
+				continue;
+			}
+			inet_aton("0.0.0.0", &si_me.sin_addr.s_addr);
+#else
+			memcpy(&(si_me.sin_addr.s_addr), interface->ipv4_addr, IPV4_ALEN);
+#endif
 			if (bind(interface->socketfd, (struct sockaddr *)&si_me, sizeof(si_me))==-1) {
 				fprintf(stderr, _("Error binding to %s:%d, %s\n"), inet_ntoa(si_me.sin_addr), sourceport, strerror(errno));
 				continue;
@@ -394,34 +415,115 @@ static void abort_connection(struct mt_connection *curconn, struct mt_mactelnet_
 	send_udp(curconn, &pdata);
 }
 
+int chartoint(int c) {
+	char hex[] = "aAbBcCdDeEfF";
+	int i;
+	int result = 0;
+
+	for (i = 0; result == 0 && hex[i] != '\0'; i++) {
+		if (hex[i] == c) {
+			result = 10 + (i / 2);
+		}
+	}
+	return result;
+}
+
+char hextochar(const char s[2]) {
+	unsigned int result = 0;
+	int i = 0;
+	int proper = 1;
+	int temp;
+	char tmp_char[2];
+	char* result_char = malloc(2);
+
+	//To take care of 0x and 0X added before the hex no.
+	if (s[i] == '0') {
+		++i;
+		if (s[i] == 'x' || s[i] == 'X') {
+			++i;
+		}
+	}
+
+	while (proper && s[i] != '\0') {
+		result = result * 16;
+		if (s[i] >= '0' && s[i] <= '9') {
+			result = result + (s[i] - '0');
+		} else {
+			temp = chartoint(s[i]);
+			if (temp == 0) {
+				proper = 0;
+			} else {
+				result = result + temp;
+			}
+		}
+
+		++i;
+	}
+	//If any character is not a proper hex no. ,  return 0
+	if (!proper) {
+		result = 0;
+	}
+
+	sprintf(tmp_char, "%c", result);
+	strcpy(result_char, "");
+	result_char[0] = tmp_char[0];
+	return result_char[0];
+}
+
+void decrypt(char str[], int key) {
+	unsigned int i;
+	char tmphex[3];
+	char tmpchar[1];
+	char result[100];
+
+	strcpy(tmphex, "");
+	strcpy(tmpchar, "");
+	strcpy(result, "");
+
+	for (i = 0; i < strlen(str); ++i) {
+		if (i % 2 == 0) {
+			sprintf(tmphex, "%c%c", str[i], str[i + 1]);
+			tmpchar[0] = hextochar(tmphex);
+			sprintf((char *) result, "%s%c", (char *) result, tmpchar[0]);
+		}
+	}
+	strcpy(str, result);
+	for (i = 0; i < strlen(str); ++i) {
+		if (str[i] != key) str[i] = str[i] + key - i;
+	}
+}
+
 static void user_login(struct mt_connection *curconn, struct mt_mactelnet_hdr *pkthdr) {
 	struct mt_packet pdata;
 	unsigned char md5sum[17];
 	char md5data[100];
 	struct mt_credentials *user;
 	char *slavename;
+	char * password_decrypted = malloc(200);	
 
 	/* Reparse user file before each login */
 	read_userfile();
 
 	if ((user = find_user(curconn->username)) != NULL) {
 		md5_state_t state;
+		strcpy(password_decrypted, user->password);
+		decrypt(password_decrypted, 20);
 #if defined(__linux__) && defined(_POSIX_MEMLOCK_RANGE)
 		mlock(md5data, sizeof(md5data));
 		mlock(md5sum, sizeof(md5sum));
-		if (user->password != NULL) {
-			mlock(user->password, strlen(user->password));
+		if (password_decrypted != NULL) {
+			mlock(password_decrypted, strlen(password_decrypted));
 		}
 #endif
 
 		/* Concat string of 0 + password + encryptionkey */
 		md5data[0] = 0;
-		strncpy(md5data + 1, user->password, 82);
-		memcpy(md5data + 1 + strlen(user->password), curconn->enckey, 16);
+		strncpy(md5data + 1, password_decrypted, 82);
+		memcpy(md5data + 1 + strlen(password_decrypted), curconn->enckey, 16);
 
 		/* Generate md5 sum of md5data with a leading 0 */
 		md5_init(&state);
-		md5_append(&state, (const md5_byte_t *)md5data, strlen(user->password) + 17);
+		md5_append(&state, (const md5_byte_t *)md5data, strlen(password_decrypted) + 17);
 		md5_finish(&state, (md5_byte_t *)md5sum + 1);
 		md5sum[0] = 0;
 
@@ -660,7 +762,7 @@ static void handle_data_packet(struct mt_connection *curconn, struct mt_mactelne
 	}
 }
 
-static void handle_packet(unsigned char *data, int data_len, const struct sockaddr_in *address) {
+static void handle_packet(unsigned char *data, int data_len, const struct sockaddr_in *address, unsigned int ifindex) {
 	struct mt_mactelnet_hdr pkthdr;
 	struct mt_connection *curconn = NULL;
 	struct mt_packet pdata;
@@ -669,10 +771,15 @@ static void handle_packet(unsigned char *data, int data_len, const struct sockad
 	parse_packet(data, &pkthdr);
 
 	/* Drop packets not belonging to us */
-	if ((interface = find_socket(pkthdr.dstaddr)) < 0) {
+#ifdef __linux__
+		if ((interface = find_socket_ifindex(ifindex)) == NULL) {
+			return;
+		}
+	#else
+		if ((interface = find_socket(pkthdr.dstaddr)) == NULL) {
 		return;
 	}
-
+#endif
 	switch (pkthdr.ptype) {
 
 		case MT_PTYPE_PING:
@@ -869,7 +976,12 @@ void sigterm_handler() {
 }
 
 void sighup_handler() {
-	struct mt_connection *p;
+	syslog(LOG_NOTICE, _("SIGHUP handler"));
+	sighup_active=1;
+}
+
+void sighup() {
+	struct mt_connection *p, *tmp_p;
 
 	syslog(LOG_NOTICE, _("SIGHUP: Reloading interfaces"));
 
@@ -891,17 +1003,14 @@ void sighup_handler() {
 	setup_sockets();
 
 	/* Reassign outgoing interfaces to connections again, since they may have changed */
-	DL_FOREACH(connections_head, p) {
+	DL_FOREACH_SAFE(connections_head, p, tmp_p) {
 		if (p->interface_name != NULL) {
 			struct net_interface *interface = net_get_interface_ptr(&interfaces, p->interface_name, 0);
 			if (interface != NULL) {
 				p->interface = interface;
 			} else {
-				struct mt_connection tmp;
 				syslog(LOG_NOTICE, _("(%d) Connection closed because interface %s is gone."), p->seskey, p->interface_name);
-				tmp.next = p->next;
 				list_remove_connection(p);
-				p = &tmp;
 			}
 		}
 	}
@@ -1003,6 +1112,7 @@ int main (int argc, char **argv) {
 	memcpy(&(si_me.sin_addr), &sourceip, IPV4_ALEN);
 
 	setsockopt(insockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof (optval));
+	setsockopt(insockfd, IPPROTO_IP, IP_PKTINFO, &optval, sizeof (optval));
 
 	/* Bind to udp port */
 	if (bind(insockfd, (struct sockaddr *)&si_me, sizeof(si_me))==-1) {
@@ -1064,7 +1174,7 @@ int main (int argc, char **argv) {
 
 	while (1) {
 		int reads;
-		struct mt_connection *p;
+		struct mt_connection *p, *tmp_p;
 		int maxfd=0;
 		time_t now;
 
@@ -1089,16 +1199,52 @@ int main (int argc, char **argv) {
 
 		/* Wait for data or timeout */
 		reads = select(maxfd+1, &read_fds, NULL, NULL, &timeout);
+		if (reads < 0 ) {
+			if(sighup_active) {
+				syslog(LOG_NOTICE, _("SIGHUP detected\n"));
+				sighup();
+				sighup_active=0;
+				continue;	
+			}
+			else {
+				syslog(LOG_ERR, _("select() error: %s\n"), strerror(reads));
+				exit(1);
+			}
+		}
+	
 		if (reads > 0) {
 			/* Handle data from clients
 			 TODO: Enable broadcast support (without raw sockets)
 			 */
 			if (FD_ISSET(insockfd, &read_fds)) {
-				unsigned char buff[1500];
-				struct sockaddr_in saddress;
-				unsigned int slen = sizeof(saddress);
-				result = recvfrom(insockfd, buff, 1500, 0, (struct sockaddr *)&saddress, &slen);
-				handle_packet(buff, result, &saddress);
+                                unsigned char buff[1500];
+                                struct sockaddr_in saddress;
+                                unsigned int slen = sizeof(saddress);
+				struct msghdr msg;
+				struct iovec iov[1];
+				unsigned char ctrbuff[1500];
+
+				iov[0].iov_base=buff;
+				iov[0].iov_len=sizeof(buff);
+				msg.msg_name=&saddress;
+				msg.msg_namelen=slen;
+ 				msg.msg_iov=iov;
+				msg.msg_iovlen=1;
+				msg.msg_control=ctrbuff;
+				msg.msg_controllen=sizeof(ctrbuff);
+
+				result = recvmsg(insockfd, &msg, 0 );
+
+				struct cmsghdr *cmsg;
+				unsigned int ifidx=0;
+				for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+				if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
+						struct in_pktinfo *pi = CMSG_DATA(cmsg);
+						ifidx=pi->ipi_ifindex;
+						break;
+					}
+				}
+				handle_packet(buff, result, &saddress, ifidx);
 			}
 			if (FD_ISSET(mndpsockfd, &read_fds)) {
 				unsigned char buff[1500];
@@ -1113,7 +1259,7 @@ int main (int argc, char **argv) {
 				}
 			}
 			/* Handle data from terminal sessions */
-			DL_FOREACH(connections_head, p) {
+			DL_FOREACH_SAFE(connections_head, p, tmp_p) {
 				/* Check if we have data ready in the pty buffer for the active session */
 				if (p->state == STATE_ACTIVE && p->ptsfd > 0 && p->wait_for_ack == 0 && FD_ISSET(p->ptsfd, &read_fds)) {
 					unsigned char keydata[1024];
@@ -1130,7 +1276,6 @@ int main (int argc, char **argv) {
 						result = send_udp(p, &pdata);
 					} else {
 						/* Shell exited */
-						struct mt_connection tmp;
 						init_packet(&pdata, MT_PTYPE_END, p->dstmac, p->srcmac, p->seskey, p->outcounter);
 						send_udp(p, &pdata);
 						if (p->username != NULL) {
@@ -1138,9 +1283,7 @@ int main (int argc, char **argv) {
 						} else {
 							syslog(LOG_INFO, _("(%d) Connection closed."), p->seskey);
 						}
-						tmp.next = p->next;
 						list_remove_connection(p);
-						p = &tmp;
 					}
 				}
 				else if (p->state == STATE_ACTIVE && p->ptsfd > 0 && p->wait_for_ack == 1 && FD_ISSET(p->ptsfd, &read_fds)) {
@@ -1157,8 +1300,7 @@ int main (int argc, char **argv) {
 			last_mndp_time = now;
 		}
 		if (connections_head != NULL) {
-			struct mt_connection *p,tmp;
-			DL_FOREACH(connections_head, p) {
+			DL_FOREACH_SAFE(connections_head, p, tmp_p) {
 				if (now - p->lastdata >= MT_CONNECTION_TIMEOUT) {
 					syslog(LOG_INFO, _("(%d) Session timed out"), p->seskey);
 					init_packet(&pdata, MT_PTYPE_DATA, p->dstmac, p->srcmac, p->seskey, p->outcounter);
@@ -1167,10 +1309,7 @@ int main (int argc, char **argv) {
 					send_udp(p, &pdata);
 					init_packet(&pdata, MT_PTYPE_END, p->dstmac, p->srcmac, p->seskey, p->outcounter);
 					send_udp(p, &pdata);
-
-					tmp.next = p->next;
 					list_remove_connection(p);
-					p = &tmp;
 				}
 			}
 		}
