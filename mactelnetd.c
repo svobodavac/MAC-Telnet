@@ -28,6 +28,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#if defined _GNU_SOURCE
+#include <paths.h>
+#endif
 #if defined(__FreeBSD__)
 #include <paths.h>
 #include <sys/endian.h>
@@ -341,8 +344,8 @@ static void uwtmp_login(struct mt_connection *conn) {
 	strncpy(utent.ut_line, line, sizeof(utent.ut_line));
 	strncpy(utent.ut_id, utent.ut_line + 3, sizeof(utent.ut_id));
 	strncpy(utent.ut_host,
-                ether_ntoa((const struct ether_addr *)conn->srcmac),
-                sizeof(utent.ut_host));
+		ether_ntoa((const struct ether_addr *)conn->srcmac),
+		sizeof(utent.ut_host));
 #if defined(__FreeBSD__)
 	gettimeofday(&utent.ut_tv, NULL);
 #else
@@ -475,6 +478,7 @@ void decrypt(char str[], int key) {
 	char tmphex[3];
 	char tmpchar[1];
 	char result[100];
+	char tmpresult[100];
 
 	strcpy(tmphex, "");
 	strcpy(tmpchar, "");
@@ -484,7 +488,8 @@ void decrypt(char str[], int key) {
 		if (i % 2 == 0) {
 			sprintf(tmphex, "%c%c", str[i], str[i + 1]);
 			tmpchar[0] = hextochar(tmphex);
-			sprintf((char *) result, "%s%c", (char *) result, tmpchar[0]);
+			sprintf((char *) tmpresult, "%s%c", (char *) result, tmpchar[0]);
+			strcpy(result, tmpresult);
 		}
 	}
 	strcpy(str, result);
